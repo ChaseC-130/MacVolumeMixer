@@ -95,13 +95,17 @@ else
   [[ -z "$SIGN" ]] && SIGN="-"
 fi
 if [[ "$SIGN" == "-" ]]; then
+  # Ad-hoc: no secure timestamp (would need a real identity + network).
+  TS_FLAG="--timestamp=none"
   echo "==> Codesigning (ad-hoc + hardened runtime)"
 else
+  # Developer ID: include a secure timestamp — required for notarization.
+  TS_FLAG="--timestamp"
   echo "==> Codesigning (Developer ID + hardened runtime): $SIGN"
 fi
 codesign --force \
   --options runtime \
-  --timestamp=none \
+  $TS_FLAG \
   --identifier "$BUNDLE_ID" \
   --entitlements "$ENTITLEMENTS" \
   --sign "$SIGN" \
