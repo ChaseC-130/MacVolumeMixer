@@ -19,9 +19,13 @@ extension String: @retroactive LocalizedError {
 // MARK: - Concrete Property Helpers
 
 extension AudioObjectID {
-    /// Reads the current default system output device ID.
-    static func readDefaultSystemOutputDevice() throws -> AudioDeviceID {
-        try AudioObjectID.system.read(kAudioHardwarePropertyDefaultSystemOutputDevice, defaultValue: AudioDeviceID.unknown)
+    /// Reads the current default OUTPUT device — the device regular application
+    /// audio plays through (what the user picks in Sound settings / Control
+    /// Center). NOTE: deliberately kAudioHardwarePropertyDefaultOutputDevice, NOT
+    /// kAudioHardwarePropertyDefaultSystemOutputDevice — the latter is only the
+    /// system alert / UI-sounds device and is frequently a different device.
+    static func readDefaultOutputDevice() throws -> AudioDeviceID {
+        try AudioObjectID.system.read(kAudioHardwarePropertyDefaultOutputDevice, defaultValue: AudioDeviceID.unknown)
     }
 
     /// Reads all audio device object IDs known to the system.
@@ -61,6 +65,23 @@ extension AudioObjectID {
 
     /// True if the device exposes any output channels (i.e. is a playback device).
     var hasOutputStreams: Bool { channelCounts(scope: kAudioObjectPropertyScopeOutput).channels > 0 }
+
+    /// The device's designated stereo (left, right) output channels as 0-based
+    /// indices. On a multichannel device (e.g. a display with a speaker array)
+    /// the stereo pair is not necessarily channels 0/1. Returns nil if the
+    /// device doesn't advertise a preferred stereo pair.
+    func preferredStereoChannels() -> (left: Int, right: Int)? {
+        var addr = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyPreferredChannelsForStereo,
+            mScope: kAudioObjectPropertyScopeOutput,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var chans: [UInt32] = [0, 0]
+        var size = UInt32(MemoryLayout<UInt32>.size * 2)
+        let err = AudioObjectGetPropertyData(self, &addr, 0, nil, &size, &chans)
+        guard err == noErr, chans[0] >= 1, chans[1] >= 1 else { return nil }
+        return (Int(chans[0]) - 1, Int(chans[1]) - 1)   // property is 1-based
+    }
 
     /// Reads all active Core Audio process object IDs.
     static func readProcessList() throws -> [AudioObjectID] {

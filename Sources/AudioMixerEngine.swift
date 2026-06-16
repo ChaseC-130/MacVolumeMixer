@@ -51,7 +51,7 @@ final class AudioMixerEngine {
 
     private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
     private var deviceListenerAddr = AudioObjectPropertyAddress(
-        mSelector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+        mSelector: kAudioHardwarePropertyDefaultOutputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
@@ -74,7 +74,7 @@ final class AudioMixerEngine {
             return
         }
 
-        let defaultUID = try? AudioObjectID.readDefaultSystemOutputDevice().readDeviceUID()
+        let defaultUID = try? AudioObjectID.readDefaultOutputDevice().readDeviceUID()
 
         // Group apps by the device they will actually play through.
         var groups: [String: [ControlledApp]] = [:]
@@ -195,11 +195,13 @@ private final class DeviceGraph {
         }
         self.tapIDs = createdTaps
 
-        // 2. Output device this graph plays through, and its own input channel
-        //    count (those input channels precede the taps in the aggregate input
-        //    layout, so they offset the tap channel mapping).
-        let inputBaseOffset = AudioObjectID.readDeviceID(forUID: outputDeviceUID)?
-            .channelCounts(scope: kAudioObjectPropertyScopeInput).channels ?? 0
+        // 2. Output device this graph plays through. Its own input channel count
+        //    precedes the taps in the aggregate input layout (offsets the tap
+        //    mapping); its preferred stereo pair tells us which output channels
+        //    are L/R (channels 0/1 on a multichannel device may be wrong).
+        let outDevID = AudioObjectID.readDeviceID(forUID: outputDeviceUID)
+        let inputBaseOffset = outDevID?.channelCounts(scope: kAudioObjectPropertyScopeInput).channels ?? 0
+        let stereoOut = outDevID?.preferredStereoChannels() ?? (left: 0, right: 1)
 
         // 3. Aggregate combining the output sub-device + this group's taps.
         let aggUID = UUID().uuidString
@@ -227,10 +229,12 @@ private final class DeviceGraph {
 
         let inCfg = aggID.channelCounts(scope: kAudioObjectPropertyScopeInput)
         let outCfg = aggID.channelCounts(scope: kAudioObjectPropertyScopeOutput)
+        let devName = outDevID?.readDeviceName() ?? outputDeviceUID
         logger.info("""
-        Graph[\(self.outputDeviceUID)] taps=\(apps.count) \
+        Graph[\(devName, privacy: .public)] taps=\(apps.count) \
         input channels=\(inCfg.channels) (expected \(inputBaseOffset + apps.count * 2)) \
-        output channels=\(outCfg.channels) baseOffset=\(inputBaseOffset)
+        output channels=\(outCfg.channels) baseOffset=\(inputBaseOffset) \
+        stereoOut=(\(stereoOut.left),\(stereoOut.right))
         """)
 
         // 4. RT volume-pointer table (tap order) + the mixing IOProc.
@@ -242,6 +246,8 @@ private final class DeviceGraph {
         let volBase = table.baseAddress!
         let tapCount = apps.count
         let baseOffset = inputBaseOffset
+        let outLeftCh = stereoOut.left
+        let outRightCh = stereoOut.right
 
         var newProcID: AudioDeviceIOProcID?
         let procErr = AudioDeviceCreateIOProcIDWithBlock(&newProcID, aggID, ioQueue) {
@@ -251,7 +257,9 @@ private final class DeviceGraph {
                 output: outOutputData,
                 volumes: volBase,
                 tapCount: tapCount,
-                inputBaseOffset: baseOffset
+                inputBaseOffset: baseOffset,
+                outLeftCh: outLeftCh,
+                outRightCh: outRightCh
             )
         }
         guard procErr == noErr, let liveProc = newProcID else {
@@ -294,7 +302,9 @@ private final class DeviceGraph {
         output: UnsafeMutablePointer<AudioBufferList>,
         volumes: UnsafePointer<UnsafeMutablePointer<Float>>,
         tapCount: Int,
-        inputBaseOffset: Int
+        inputBaseOffset: Int,
+        outLeftCh: Int,
+        outRightCh: Int
     ) {
         let inList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
         let outList = UnsafeMutableAudioBufferListPointer(output)
@@ -309,8 +319,10 @@ private final class DeviceGraph {
                 let frames = min(outFrames, inFrames)
                 guard frames > 0, inChCount > 0 else { return }
 
-                let leftIdx = 0
-                let rightIdx = outChCount >= 2 ? 1 : 0   // mono output: fold R into ch0
+                // Route to the device's designated stereo channels (clamped),
+                // not blindly to 0/1 — matters on multichannel output devices.
+                let leftIdx = min(max(outLeftCh, 0), outChCount - 1)
+                let rightIdx = min(max(outRightCh, 0), outChCount - 1)
 
                 for i in 0..<tapCount {
                     let lInIdx = inputBaseOffset + 2 * i
