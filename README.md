@@ -25,6 +25,25 @@ re-rendered, scaled by its volume, into whichever output device you choose for i
 ./build.sh run    # ...and launch it
 ```
 
+### Package a release DMG
+
+```bash
+./package_dmg.sh                            # build/AppVolumeMixer-<ver>.dmg (drag-to-Applications)
+NOTARY_PROFILE=AVM-notary ./package_dmg.sh  # ...and notarize + staple
+```
+
+Set up the notary profile once (uses an app-specific password from appleid.apple.com):
+
+```bash
+xcrun notarytool store-credentials AVM-notary --apple-id "<your-apple-id>" --team-id "<your-team-id>"
+```
+
+### Install (from a release DMG)
+
+Open the `.dmg`, drag **App Volume Mixer** onto **Applications**, then launch it. If
+the build isn't notarized, right-click the app → **Open** the first time (or allow it
+under System Settings → Privacy & Security).
+
 The app appears as a slider icon (􀟫) in the menu bar. On first launch macOS asks
 for permission to record/capture system audio — **click Allow**. (This grants the
 `kTCCServiceAudioCapture` permission the tap API requires.)
