@@ -40,7 +40,7 @@ final class MixerManager {
     // Audio identity → controlled app (holds the RT volume pointer + tap UUID).
     private var controlled: [AudioObjectID: ControlledApp] = [:]
     // Cached UI metadata so we don't re-resolve names/icons every poll.
-    private struct Meta { let name: String; let icon: NSImage; let key: String }
+    private struct Meta { let name: String; let icon: NSImage; let key: String; let isApp: Bool }
     private var meta: [AudioObjectID: Meta] = [:]
     // Consecutive polls a controlled app has been audio-inactive (hysteresis).
     private var idlePolls: [AudioObjectID: Int] = [:]
@@ -125,6 +125,7 @@ final class MixerManager {
         for proc in active where controlled[proc.objectID] == nil {
             guard proc.pid > 0, proc.pid != myPID else { continue }
             let m = resolveMeta(objectID: proc.objectID, pid: proc.pid)
+            guard m.isApp else { continue }   // skip pure system daemons (e.g. corespeechd)
             let initial = desired[m.key] ?? 1.0
             let app = ControlledApp(
                 processObjectID: proc.objectID, pid: proc.pid, key: m.key,
@@ -134,6 +135,7 @@ final class MixerManager {
             meta[proc.objectID] = m
             idlePolls[proc.objectID] = 0
             membershipChanged = true
+            logger.info("Now controlling \(m.name, privacy: .public) (key=\(m.key, privacy: .public), pid=\(proc.pid))")
         }
 
         // Age out processes that have gone inactive past the grace period.
@@ -287,12 +289,44 @@ final class MixerManager {
     // MARK: - Metadata
 
     private func resolveMeta(objectID: AudioObjectID, pid: pid_t) -> Meta {
-        let runningApp = NSWorkspace.shared.runningApplications.first { $0.processIdentifier == pid }
-        let bundleID = objectID.readProcessBundleID() ?? runningApp?.bundleIdentifier
-        let name = runningApp?.localizedName ?? processName(pid: pid) ?? "Process \(pid)"
-        let key = bundleID ?? processName(pid: pid) ?? "pid:\(pid)"
-        let icon = runningApp?.icon ?? NSWorkspace.shared.icon(for: .unixExecutable)
-        return Meta(name: name, icon: icon, key: key)
+        // Audio often comes from a helper child process (e.g. "Google Chrome
+        // Helper"), not the main app. Walk up to the owning GUI app so we show
+        // the right name + icon, and so daemons (no owning app) are filtered.
+        let owningApp = responsibleApp(for: pid)
+        let bundleID = owningApp?.bundleIdentifier ?? objectID.readProcessBundleID()
+        let name = owningApp?.localizedName ?? processName(pid: pid) ?? "Process \(pid)"
+        // Key on the owning app's bundle id so e.g. all Chrome tabs share one
+        // persisted volume and survive helper churn.
+        let key = owningApp?.bundleIdentifier ?? bundleID ?? processName(pid: pid) ?? "pid:\(pid)"
+        let icon = owningApp?.icon ?? NSWorkspace.shared.icon(for: .unixExecutable)
+        // Only control processes owned by a real registered app. System daemons
+        // (corespeechd, mediaremoted, …) descend from launchd with no owning app
+        // — even though Core Audio may report a bundle id for them — so they are
+        // filtered out (and never tapped, avoiding interference with Siri/etc.).
+        let isApp = owningApp != nil
+        return Meta(name: name, icon: icon, key: key, isApp: isApp)
+    }
+
+    /// Finds the GUI application that "owns" a pid by walking up the parent
+    /// process chain — maps a browser/Electron audio helper to its main app.
+    /// Returns nil for system daemons whose ancestors are not registered apps.
+    private func responsibleApp(for pid: pid_t) -> NSRunningApplication? {
+        let apps = NSWorkspace.shared.runningApplications
+        var current = pid
+        for _ in 0..<12 {
+            if let app = apps.first(where: { $0.processIdentifier == current }) { return app }
+            let parent = parentPID(of: current)
+            guard parent > 1, parent != current else { break }
+            current = parent
+        }
+        return nil
+    }
+
+    private func parentPID(of pid: pid_t) -> pid_t {
+        var info = proc_bsdinfo()
+        let size = Int32(MemoryLayout<proc_bsdinfo>.size)
+        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+        return n == size ? pid_t(info.pbi_ppid) : 0
     }
 
     private func processName(pid: pid_t) -> String? {
