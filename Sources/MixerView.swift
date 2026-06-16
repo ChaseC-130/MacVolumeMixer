@@ -61,8 +61,10 @@ struct MixerView: View {
                         AppVolumeRow(
                             entry: entry,
                             maxVolume: manager.maxVolume,
+                            devices: manager.availableOutputDevices,
                             onVolumeChange: { manager.setVolume(for: entry.id, to: $0) },
-                            onMuteToggle: { manager.toggleMute(for: entry.id) }
+                            onMuteToggle: { manager.toggleMute(for: entry.id) },
+                            onDeviceChange: { manager.setOutputDevice(for: entry.id, uid: $0) }
                         )
                     }
                 }
@@ -128,15 +130,17 @@ struct MixerView: View {
 struct AppVolumeRow: View {
     let entry: MixerManager.AppMixerEntry
     let maxVolume: Float
+    let devices: [MixerManager.OutputDevice]
     var onVolumeChange: (Float) -> Void
     var onMuteToggle: () -> Void
+    var onDeviceChange: (String?) -> Void
 
     var body: some View {
         HStack(spacing: 10) {
             Image(nsImage: entry.icon)
                 .resizable().frame(width: 24, height: 24).cornerRadius(4).shadow(radius: 1)
 
-            VStack(alignment: .leading, spacing: 2) {
+            VStack(alignment: .leading, spacing: 4) {
                 HStack {
                     Text(entry.name).font(.system(size: 11, weight: .semibold)).lineLimit(1)
                     Spacer()
@@ -158,6 +162,23 @@ struct AppVolumeRow: View {
                             .frame(width: 16, height: 16)
                     }
                     .buttonStyle(.plain)
+                }
+
+                // Per-app output device routing.
+                HStack(spacing: 4) {
+                    Image(systemName: "hifispeaker.fill")
+                        .font(.system(size: 8)).foregroundColor(.secondary)
+                    Picker("", selection: Binding(
+                        get: { entry.targetDeviceUID ?? "" },
+                        set: { onDeviceChange($0.isEmpty ? nil : $0) }
+                    )) {
+                        Text("System Default").tag("")
+                        ForEach(devices) { dev in Text(dev.name).tag(dev.uid) }
+                    }
+                    .pickerStyle(.menu)
+                    .labelsHidden()
+                    .controlSize(.mini)
+                    .font(.system(size: 9))
                 }
             }
         }

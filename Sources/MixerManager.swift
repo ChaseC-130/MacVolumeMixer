@@ -17,9 +17,18 @@ final class MixerManager {
         let icon: NSImage
         var volume: Float
         var isMuted: Bool
+        var targetDeviceUID: String?   // nil = system default output
+    }
+
+    /// A selectable output device for per-app routing.
+    struct OutputDevice: Identifiable, Hashable {
+        let uid: String
+        let name: String
+        var id: String { uid }
     }
 
     private(set) var activeMixers: [AppMixerEntry] = []
+    private(set) var availableOutputDevices: [OutputDevice] = []
     private(set) var permission: AudioCapturePermission = .unknown
 
     /// Largest boost the UI/clamp allows (2.0 == 200%).
@@ -41,13 +50,22 @@ final class MixerManager {
     // Persisted desired volume keyed by bundleID/exec-name, survives tap churn.
     private var desired: [String: Float] = [:]
     private let desiredDefaultsKey = "AppVolumeMixer.desiredVolumes"
+    // Persisted per-app target output device (UID) keyed the same way.
+    private var desiredDevices: [String: String] = [:]
+    private let desiredDevicesKey = "AppVolumeMixer.desiredDevices"
 
     private var timer: Timer?
 
     init() {
         loadDesired()
-        engine.onDefaultDeviceChanged = { [weak self] in self?.rebuildEngine(force: true) }
+        engine.onDefaultDeviceChanged = { [weak self] in
+            // Default output changed: re-route apps that follow it, and refresh
+            // the device list (the default may have appeared/disappeared).
+            self?.refreshDevices()
+            self?.rebuildEngine(force: true)
+        }
         permission = PermissionManager.preflight()
+        refreshDevices()
     }
 
     // MARK: - Lifecycle
@@ -96,6 +114,7 @@ final class MixerManager {
     /// refreshes the UI rows.
     func refresh() {
         guard permission == .authorized else { return }
+        refreshDevices()
 
         let active = discoverActiveProcesses()
         let activeIDs = Set(active.map(\.objectID))
@@ -107,7 +126,10 @@ final class MixerManager {
             guard proc.pid > 0, proc.pid != myPID else { continue }
             let m = resolveMeta(objectID: proc.objectID, pid: proc.pid)
             let initial = desired[m.key] ?? 1.0
-            let app = ControlledApp(processObjectID: proc.objectID, pid: proc.pid, key: m.key, initialVolume: initial)
+            let app = ControlledApp(
+                processObjectID: proc.objectID, pid: proc.pid, key: m.key,
+                initialVolume: initial, targetDeviceUID: desiredDevices[m.key]
+            )
             controlled[proc.objectID] = app
             meta[proc.objectID] = m
             idlePolls[proc.objectID] = 0
@@ -160,8 +182,8 @@ final class MixerManager {
     /// rebuilds even if membership is unchanged (used on default-device change).
     private func rebuildEngine(force: Bool = false) {
         let ordered = controlled.values.sorted { $0.pid < $1.pid }   // deterministic tap order
-        let orderedIDs = ordered.map(\.processObjectID)
-        if !force && orderedIDs == engine.builtKeys { return }
+        // Membership guard only — routing/default changes always pass force:true.
+        if !force && Set(ordered.map(\.processObjectID)) == engine.builtProcessIDs { return }
 
         do {
             try engine.rebuild(with: ordered)
@@ -216,6 +238,31 @@ final class MixerManager {
         }
     }
 
+    /// Routes an app to a specific output device (nil = system default).
+    func setOutputDevice(for id: AudioObjectID, uid: String?) {
+        guard let app = controlled[id] else { return }
+        app.targetDeviceUID = uid
+        if let uid { desiredDevices[app.key] = uid } else { desiredDevices.removeValue(forKey: app.key) }
+        saveDesiredDevices()
+        if let i = activeMixers.firstIndex(where: { $0.id == id }) {
+            activeMixers[i].targetDeviceUID = uid
+        }
+        rebuildEngine(force: true)   // re-group apps by device
+    }
+
+    // MARK: - Output device enumeration
+
+    private func refreshDevices() {
+        guard let ids = try? AudioObjectID.readAllDeviceIDs() else { return }
+        var list: [OutputDevice] = []
+        for id in ids where id.hasOutputStreams {
+            guard let uid = try? id.readDeviceUID() else { continue }
+            list.append(OutputDevice(uid: uid, name: id.readDeviceName()))
+        }
+        list.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        if list != availableOutputDevices { availableOutputDevices = list }
+    }
+
     // MARK: - UI rows
 
     private func rebuildUIRows() {
@@ -227,7 +274,8 @@ final class MixerManager {
                 name: m.name,
                 icon: m.icon,
                 volume: app.volume,
-                isMuted: app.volume == 0
+                isMuted: app.volume == 0,
+                targetDeviceUID: app.targetDeviceUID
             )
         }
         // Alphabetical, computed only on rebuild (stable identity keeps rows put).
@@ -260,9 +308,16 @@ final class MixerManager {
         if let dict = UserDefaults.standard.dictionary(forKey: desiredDefaultsKey) as? [String: Double] {
             desired = dict.mapValues { Float($0) }
         }
+        if let dict = UserDefaults.standard.dictionary(forKey: desiredDevicesKey) as? [String: String] {
+            desiredDevices = dict
+        }
     }
 
     private func saveDesired() {
         UserDefaults.standard.set(desired.mapValues { Double($0) }, forKey: desiredDefaultsKey)
+    }
+
+    private func saveDesiredDevices() {
+        UserDefaults.standard.set(desiredDevices, forKey: desiredDevicesKey)
     }
 }

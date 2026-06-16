@@ -24,6 +24,44 @@ extension AudioObjectID {
         try AudioObjectID.system.read(kAudioHardwarePropertyDefaultSystemOutputDevice, defaultValue: AudioDeviceID.unknown)
     }
 
+    /// Reads all audio device object IDs known to the system.
+    static func readAllDeviceIDs() throws -> [AudioObjectID] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioHardwarePropertyDevices,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        var err = AudioObjectGetPropertyDataSize(.system, &address, 0, nil, &dataSize)
+        guard err == noErr else { throw "Failed to get device list size: \(err)" }
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        var value = [AudioObjectID](repeating: .unknown, count: count)
+        err = AudioObjectGetPropertyData(.system, &address, 0, nil, &dataSize, &value)
+        guard err == noErr else { throw "Failed to get device list: \(err)" }
+        return value
+    }
+
+    /// Translates a device UID string back to its AudioDeviceID, or nil if no
+    /// such device is currently present.
+    static func readDeviceID(forUID uid: String) -> AudioObjectID? {
+        guard let id: AudioObjectID = try? AudioObjectID.system.read(
+            kAudioHardwarePropertyTranslateUIDToDevice,
+            defaultValue: AudioObjectID.unknown,
+            qualifier: uid as CFString
+        ), id.isValid else { return nil }
+        return id
+    }
+
+    /// Human-readable device name.
+    func readDeviceName() -> String {
+        if let n = try? readString(kAudioObjectPropertyName), !n.isEmpty { return n }
+        if let n = try? readString(kAudioDevicePropertyDeviceNameCFString), !n.isEmpty { return n }
+        return "Unknown Device"
+    }
+
+    /// True if the device exposes any output channels (i.e. is a playback device).
+    var hasOutputStreams: Bool { channelCounts(scope: kAudioObjectPropertyScopeOutput).channels > 0 }
+
     /// Reads all active Core Audio process object IDs.
     static func readProcessList() throws -> [AudioObjectID] {
         var address = AudioObjectPropertyAddress(

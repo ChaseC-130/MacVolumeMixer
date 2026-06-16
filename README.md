@@ -1,13 +1,16 @@
 # MacVolumeMixer (App Volume Mixer)
 
-A lightweight macOS **menu-bar app** that controls the **output volume of individual
-applications independently** — turn down your browser while a game stays loud, mute
-one app without touching the rest.
+A lightweight macOS **menu-bar app** that controls **each application's audio
+independently**:
+
+- **Per-app volume** — turn down your browser while a game stays loud; mute one app
+  without touching the rest (0–200%, boost soft-clipped).
+- **Per-app output device** — send one app to your speakers and another to your
+  headphones at the same time.
 
 It uses the modern Core Audio **process-tap** API (macOS 14.4+) — no kernel
-extension, no virtual driver to install. Each audio-playing app is tapped, and a
-single private aggregate device re-renders every tap into your speakers scaled by a
-per-app volume.
+extension, no virtual driver to install. Each audio-playing app is tapped and
+re-rendered, scaled by its volume, into whichever output device you choose for it.
 
 ## Requirements
 
@@ -31,16 +34,19 @@ Security → Audio**, or use the in-app button.
 
 ## How it works
 
+Apps are grouped by their chosen output device; each device gets its own private
+aggregate device + mixing I/O proc. (Different devices → independent graphs, so
+they never contend for the same hardware.)
+
 ```
-default output device ─┐
-                       ├── ONE private aggregate device ──> ONE AudioDeviceIOProc
-app A ──(stereo tap)───┤                                     mixes each tap * volume
-app B ──(stereo tap)───┘                                     -> output (clamped)
+Speakers ◀── aggregate(Speakers) ◀── IOProc ◀── tap A (vol), tap C (vol)
+AirPods  ◀── aggregate(AirPods)  ◀── IOProc ◀── tap B (vol)
 ```
 
-- `AudioMixerEngine.swift` — owns the single aggregate device + the real-time
-  mixing I/O proc (vDSP, lock-free, no ARC on the audio thread). Rebuilt only when
-  the set of audio-playing apps changes or the default output device changes.
+- `AudioMixerEngine.swift` — coordinates one `DeviceGraph` per target output
+  device; each graph is an aggregate device + a real-time mixing I/O proc (vDSP,
+  lock-free, no ARC on the audio thread). Rebuilt when the set of audio-playing
+  apps, an app's chosen device, or the default output device changes.
 - `MixerManager.swift` — `@MainActor @Observable`; discovers audio-active processes
   (`kAudioProcessPropertyIsRunning`), keeps a persistent per-app volume map
   (`UserDefaults`, keyed by bundle id), and drives the engine.
