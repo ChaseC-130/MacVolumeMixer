@@ -12,6 +12,9 @@ set -euo pipefail
 APP_NAME="AppVolumeMixer"
 BUNDLE_ID="com.antigravity.AppVolumeMixer"
 MIN_MACOS="14.2"
+APP_VERSION="${APP_VERSION:-1.1.0}"
+BUILD_NUMBER="${BUILD_NUMBER:-2}"
+ARCHS="${ARCHS:-arm64 x86_64}"
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SRC="$ROOT/Sources"
@@ -27,17 +30,29 @@ rm -rf "$BUILD"
 mkdir -p "$MACOS_DIR" "$RES_DIR"
 
 echo "==> Compiling Swift sources"
-# Release build, arm64+x86_64 not needed (dev machine is arm64); target the
-# minimum OS that ships the process-tap API.
-swiftc -O \
-  -o "$MACOS_DIR/$APP_NAME" \
-  "$SRC"/*.swift \
-  -framework SwiftUI \
-  -framework AppKit \
-  -framework AudioToolbox \
-  -framework AVFoundation \
-  -framework Accelerate \
-  -target "arm64-apple-macos${MIN_MACOS}"
+# Compile each requested architecture and combine them into one release binary.
+# Override with ARCHS=arm64 for a faster local-only build.
+THIN_BINARIES=()
+for ARCH in $ARCHS; do
+  THIN="$BUILD/$APP_NAME-$ARCH"
+  echo "    $ARCH"
+  swiftc -O -whole-module-optimization \
+    -o "$THIN" \
+    "$SRC"/*.swift \
+    -framework SwiftUI \
+    -framework AppKit \
+    -framework AudioToolbox \
+    -framework Accelerate \
+    -target "${ARCH}-apple-macos${MIN_MACOS}"
+  THIN_BINARIES+=("$THIN")
+done
+
+if [[ ${#THIN_BINARIES[@]} -eq 1 ]]; then
+  mv "${THIN_BINARIES[0]}" "$MACOS_DIR/$APP_NAME"
+else
+  lipo -create "${THIN_BINARIES[@]}" -output "$MACOS_DIR/$APP_NAME"
+  rm -f "${THIN_BINARIES[@]}"
+fi
 
 echo "==> Writing Info.plist"
 cat > "$CONTENTS/Info.plist" <<EOF
@@ -56,11 +71,15 @@ cat > "$CONTENTS/Info.plist" <<EOF
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0</string>
+    <string>${APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>${BUILD_NUMBER}</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
     <string>${MIN_MACOS}</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
     <key>LSUIElement</key>
     <true/>
     <key>NSAudioCaptureUsageDescription</key>
@@ -112,7 +131,9 @@ codesign --force \
   "$APP"
 
 echo "==> Verifying signature"
+codesign --verify --deep --strict --verbose=2 "$APP"
 codesign -dvv "$APP" 2>&1 | sed 's/^/    /'
+echo "==> Architectures: $(lipo -archs "$MACOS_DIR/$APP_NAME")"
 
 echo "==> Built $APP"
 

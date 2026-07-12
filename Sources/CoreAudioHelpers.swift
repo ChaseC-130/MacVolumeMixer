@@ -124,9 +124,11 @@ extension AudioObjectID {
         return nil
     }
 
-    /// Reads whether the process is currently running audio.
-    func readProcessIsRunning() -> Bool {
-        (try? readBool(kAudioProcessPropertyIsRunning)) ?? false
+    /// Reads whether the process currently has at least one active OUTPUT
+    /// stream. The generic `IsRunning` property also includes input-only apps
+    /// such as recorders and meeting tools, which must never be tapped here.
+    func readProcessIsRunningOutput() -> Bool {
+        (try? readBool(kAudioProcessPropertyIsRunningOutput)) ?? false
     }
 
     /// Reads the device UID for an audio device.
@@ -137,6 +139,41 @@ extension AudioObjectID {
     /// Reads the basic stream format description of an audio tap.
     func readAudioTapStreamBasicDescription() throws -> AudioStreamBasicDescription {
         try read(kAudioTapPropertyFormat, defaultValue: AudioStreamBasicDescription())
+    }
+
+    /// Reads back the UID assigned to a tap by the HAL. The aggregate-device
+    /// composition must use this value rather than assuming the requested UUID
+    /// was accepted unchanged.
+    func readAudioTapUID() throws -> String {
+        try readString(kAudioTapPropertyUID)
+    }
+
+    /// Reads every virtual stream format in one device scope. An IOProc receives
+    /// data in these formats, so the mixer validates them before interpreting
+    /// callback memory as Float32.
+    func readStreamFormats(scope: AudioObjectPropertyScope) throws -> [AudioStreamBasicDescription] {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyStreams,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var dataSize: UInt32 = 0
+        var err = AudioObjectGetPropertyDataSize(self, &address, 0, nil, &dataSize)
+        guard err == noErr else { throw "Failed to get stream list size: \(err)" }
+
+        let count = Int(dataSize) / MemoryLayout<AudioObjectID>.size
+        guard count > 0 else { return [] }
+        var streamIDs = [AudioObjectID](repeating: .unknown, count: count)
+        err = AudioObjectGetPropertyData(self, &address, 0, nil, &dataSize, &streamIDs)
+        guard err == noErr else { throw "Failed to get stream list: \(err)" }
+
+        return try streamIDs.map {
+            try $0.read(kAudioStreamPropertyVirtualFormat, defaultValue: AudioStreamBasicDescription())
+        }
+    }
+
+    func readTransportType() -> UInt32 {
+        (try? read(kAudioDevicePropertyTransportType, defaultValue: UInt32(0))) ?? 0
     }
 
     /// Returns (bufferCount, totalChannels) for a device's stream configuration
@@ -160,6 +197,25 @@ extension AudioObjectID {
         var channels = 0
         for b in 0..<abl.count { channels += Int(abl[b].mNumberChannels) }
         return (abl.count, channels)
+    }
+}
+
+extension AudioStreamBasicDescription {
+    /// The render kernel supports the HAL's native Float32 linear PCM formats,
+    /// both interleaved and noninterleaved.
+    var isNativeFloat32PCM: Bool {
+        guard mFormatID == kAudioFormatLinearPCM,
+              mBitsPerChannel == 32,
+              mFramesPerPacket == 1,
+              mChannelsPerFrame > 0,
+              mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              mFormatFlags & kAudioFormatFlagIsBigEndian == 0 else { return false }
+        return true
+    }
+
+    var conciseDescription: String {
+        let layout = mFormatFlags & kAudioFormatFlagIsNonInterleaved != 0 ? "planar" : "interleaved"
+        return "\(mChannelsPerFrame)ch \(Int(mSampleRate))Hz \(mBitsPerChannel)-bit \(layout)"
     }
 }
 

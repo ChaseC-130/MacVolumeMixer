@@ -1,213 +1,305 @@
 import Foundation
 import AudioToolbox
 import CoreAudio
-import Accelerate
 import OSLog
 
-/// A single app whose output volume and target device the engine controls.
-///
-/// `volumePtr` is the real-time source of truth: read on the audio I/O thread,
-/// written on the main thread. It is a bare `UnsafeMutablePointer<Float>` (not
-/// ARC-managed) so the I/O block can capture it by value with zero retain/release
-/// traffic. On arm64 an aligned 4-byte access is tear-free, so the relaxed RT
-/// read is safe in practice; the value is only ever a volume scalar.
+/// A single Core Audio process whose output the engine controls.
 final class ControlledApp: Identifiable {
-    let processObjectID: AudioObjectID   // Core Audio process object — engine identity
+    let processObjectID: AudioObjectID
     let pid: pid_t
-    let key: String                      // bundleID ?? executable name — persistent key
+    let key: String
     let tapUUID = UUID()
     let volumePtr: UnsafeMutablePointer<Float>
     /// Target output device UID, or nil to follow the system default output.
-    /// Main-thread only; a route change triggers an engine rebuild.
     var targetDeviceUID: String?
 
-    init(processObjectID: AudioObjectID, pid: pid_t, key: String, initialVolume: Float, targetDeviceUID: String?) {
+    init(
+        processObjectID: AudioObjectID,
+        pid: pid_t,
+        key: String,
+        initialVolume: Float,
+        targetDeviceUID: String?
+    ) {
         self.processObjectID = processObjectID
         self.pid = pid
         self.key = key
         self.targetDeviceUID = targetDeviceUID
-        self.volumePtr = .allocate(capacity: 1)
-        self.volumePtr.initialize(to: initialVolume)
+        volumePtr = .allocate(capacity: 1)
+        volumePtr.initialize(to: AudioRenderKernel.sanitizedGain(initialVolume))
     }
 
     deinit { volumePtr.deallocate() }
 
     var volume: Float { volumePtr.pointee }
-    func setVolume(_ v: Float) { volumePtr.pointee = v }
+    func setVolume(_ value: Float) { volumePtr.pointee = AudioRenderKernel.sanitizedGain(value) }
 }
 
-/// Coordinates one `DeviceGraph` per distinct target output device. Apps routed
-/// to the same device share a graph (and its single mixing IOProc); apps routed
-/// to different devices get independent graphs. Different graphs drive different
-/// hardware, so they do not contend for the same output (which is why
-/// per-process aggregates on the SAME device were the original bug).
+struct AudioEngineConfigurationResult {
+    let failures: [String]
+}
+
+/// Coordinates one graph per physical output route. Unchanged graphs survive a
+/// configuration update, so an app starting on one device no longer interrupts
+/// audio already playing on another device.
 final class AudioMixerEngine {
+    static let aggregateUIDPrefix = "com.antigravity.AppVolumeMixer.aggregate."
+
     private let logger = Logger(subsystem: "com.antigravity.AppVolumeMixer", category: "Engine")
-
-    // One graph per output device UID currently in use.
     private var graphs: [String: DeviceGraph] = [:]
-    /// Process object IDs currently tapped across all graphs (membership guard).
-    private(set) var builtProcessIDs: Set<AudioObjectID> = []
 
-    private var deviceListenerBlock: AudioObjectPropertyListenerBlock?
-    private var deviceListenerAddr = AudioObjectPropertyAddress(
+    /// The most recently requested membership, including routes that failed.
+    /// Tracking requested membership prevents a failed route from destructively
+    /// retrying every discovery poll; manual refresh and hardware changes retry.
+    private(set) var configuredProcessIDs: Set<AudioObjectID> = []
+
+    var onHardwareChanged: (() -> Void)?
+    var onProcessorOverload: ((String) -> Void)?
+
+    private var systemListenerBlock: AudioObjectPropertyListenerBlock?
+    private var defaultDeviceAddress = AudioObjectPropertyAddress(
         mSelector: kAudioHardwarePropertyDefaultOutputDevice,
         mScope: kAudioObjectPropertyScopeGlobal,
         mElement: kAudioObjectPropertyElementMain
     )
-    /// Invoked on the main actor when the system default output device changes,
-    /// so the owner can rebuild (apps following the default need re-routing).
-    var onDefaultDeviceChanged: (() -> Void)?
+    private var deviceListAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDevices,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
 
-    var isRunning: Bool { !graphs.isEmpty }
+    init() {
+        installSystemListeners()
+    }
 
-    // MARK: - Public
+    /// Reconciles the desired app/device groups with live graphs. A graph is
+    /// rebuilt only if that specific device's process membership changed.
+    @discardableResult
+    func configure(with apps: [ControlledApp]) -> AudioEngineConfigurationResult {
+        let requestedIDs = Set(apps.map(\.processObjectID))
+        configuredProcessIDs = requestedIDs
 
-    /// Tear down all graphs and rebuild them, grouping `apps` by their effective
-    /// target device. Throws if every group fails to build despite having apps
-    /// (almost always the capture permission).
-    func rebuild(with apps: [ControlledApp]) throws {
-        teardownAll()
         guard !apps.isEmpty else {
-            builtProcessIDs = []
+            teardownAll()
             logger.info("Engine idle (no apps to control)")
-            return
+            return AudioEngineConfigurationResult(failures: [])
         }
 
         let defaultUID = try? AudioObjectID.readDefaultOutputDevice().readDeviceUID()
+        var desiredGroups: [String: [ControlledApp]] = [:]
+        var failures: [String] = []
 
-        // Group apps by the device they will actually play through.
-        var groups: [String: [ControlledApp]] = [:]
         for app in apps {
-            guard let uid = effectiveDeviceUID(app.targetDeviceUID, default: defaultUID) else { continue }
-            groups[uid, default: []].append(app)
+            guard let uid = effectiveDeviceUID(app.targetDeviceUID, default: defaultUID) else {
+                let message = "No compatible output is available for \(app.key). "
+                    + "Choose a hardware device instead of a virtual mixer or loopback device."
+                if !failures.contains(message) { failures.append(message) }
+                continue
+            }
+            desiredGroups[uid, default: []].append(app)
         }
-        guard !groups.isEmpty else { throw "No usable output device for any app" }
+        for uid in desiredGroups.keys {
+            desiredGroups[uid]?.sort { $0.pid < $1.pid }
+        }
 
-        var firstError: Error?
-        var built: Set<AudioObjectID> = []
-        for (uid, groupApps) in groups {
-            let ordered = groupApps.sorted { $0.pid < $1.pid }   // deterministic tap order
-            do {
-                graphs[uid] = try DeviceGraph(outputDeviceUID: uid, apps: ordered, logger: logger)
-                for a in ordered { built.insert(a.processObjectID) }
-            } catch {
-                logger.error("Graph build failed for device \(uid): \(error.localizedDescription)")
-                if firstError == nil { firstError = error }
+        // Remove obsolete or changed graphs. Unchanged routes remain live.
+        for uid in Array(graphs.keys) {
+            let desiredIDs = desiredGroups[uid]?.map(\.processObjectID)
+            guard desiredIDs == graphs[uid]?.processIDs else {
+                graphs.removeValue(forKey: uid)?.teardown()
+                continue
             }
         }
 
-        builtProcessIDs = built
-        if graphs.isEmpty, let firstError { throw firstError }   // total failure → surface (permission)
+        // Build missing routes, including previously failed routes on explicit
+        // refresh. A failed graph tears itself down completely before throwing.
+        for uid in desiredGroups.keys.sorted() where graphs[uid] == nil {
+            guard let group = desiredGroups[uid] else { continue }
+            do {
+                let graph = try DeviceGraph(
+                    outputDeviceUID: uid,
+                    apps: group,
+                    logger: logger,
+                    onProcessorOverload: { [weak self] deviceName in
+                        self?.onProcessorOverload?(deviceName)
+                    }
+                )
+                graphs[uid] = graph
+            } catch {
+                let deviceName = AudioObjectID.readDeviceID(forUID: uid)?.readDeviceName() ?? uid
+                let message = "\(deviceName): \(error.localizedDescription)"
+                failures.append(message)
+                logger.error("Graph build failed: \(message, privacy: .public)")
+            }
+        }
 
-        installDefaultDeviceListener()
-        logger.info("Engine running: \(self.graphs.count) device graph(s), \(built.count) tap(s)")
+        let builtProcessCount = Set(graphs.values.flatMap(\.processIDs)).count
+        logger.info("Engine configured: \(self.graphs.count) graph(s), \(builtProcessCount) tap(s)")
+        return AudioEngineConfigurationResult(failures: failures)
     }
 
-    func stop() { teardownAll() }
-
-    private func teardownAll() {
-        for (_, g) in graphs { g.teardown() }
-        graphs.removeAll()
-        builtProcessIDs = []
-    }
-
-    deinit {
-        removeDefaultDeviceListener()
+    func stop() {
+        configuredProcessIDs = []
         teardownAll()
     }
 
-    // MARK: - Routing helpers
-
-    /// The device an app will actually play through: its explicit target if that
-    /// device is present, else the system default.
-    private func effectiveDeviceUID(_ target: String?, default def: String?) -> String? {
-        if let t = target, AudioObjectID.readDeviceID(forUID: t) != nil { return t }
-        return def
+    private func teardownAll() {
+        for graph in graphs.values { graph.teardown() }
+        graphs.removeAll()
     }
 
-    // MARK: - Default device change
+    private func effectiveDeviceUID(_ target: String?, default defaultUID: String?) -> String? {
+        if let target,
+           let device = AudioObjectID.readDeviceID(forUID: target),
+           device.hasOutputStreams,
+           device.readTransportType() != kAudioDeviceTransportTypeVirtual {
+            return target
+        }
+        guard let defaultUID,
+              let defaultDevice = AudioObjectID.readDeviceID(forUID: defaultUID),
+              defaultDevice.hasOutputStreams,
+              defaultDevice.readTransportType() != kAudioDeviceTransportTypeVirtual else {
+            return nil
+        }
+        return defaultUID
+    }
 
-    private func installDefaultDeviceListener() {
-        guard deviceListenerBlock == nil else { return }
+    // MARK: - Hardware notifications
+
+    private func installSystemListeners() {
+        guard systemListenerBlock == nil else { return }
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
             Task { @MainActor in
-                self?.logger.info("Default output device changed — rebuilding")
-                self?.onDefaultDeviceChanged?()
+                self?.logger.info("Audio hardware routing changed")
+                self?.onHardwareChanged?()
             }
         }
-        let err = AudioObjectAddPropertyListenerBlock(.system, &deviceListenerAddr, DispatchQueue.main, block)
-        if err == noErr { deviceListenerBlock = block }
+
+        let defaultError = AudioObjectAddPropertyListenerBlock(
+            .system, &defaultDeviceAddress, DispatchQueue.main, block
+        )
+        let listError = AudioObjectAddPropertyListenerBlock(
+            .system, &deviceListAddress, DispatchQueue.main, block
+        )
+        if defaultError == noErr, listError == noErr {
+            systemListenerBlock = block
+        } else {
+            if defaultError == noErr {
+                AudioObjectRemovePropertyListenerBlock(.system, &defaultDeviceAddress, DispatchQueue.main, block)
+            }
+            if listError == noErr {
+                AudioObjectRemovePropertyListenerBlock(.system, &deviceListAddress, DispatchQueue.main, block)
+            }
+            logger.error("Unable to install all hardware listeners: \(defaultError), \(listError)")
+        }
     }
 
-    private func removeDefaultDeviceListener() {
-        guard let block = deviceListenerBlock else { return }
-        AudioObjectRemovePropertyListenerBlock(.system, &deviceListenerAddr, DispatchQueue.main, block)
-        deviceListenerBlock = nil
+    private func removeSystemListeners() {
+        guard let block = systemListenerBlock else { return }
+        AudioObjectRemovePropertyListenerBlock(.system, &defaultDeviceAddress, DispatchQueue.main, block)
+        AudioObjectRemovePropertyListenerBlock(.system, &deviceListAddress, DispatchQueue.main, block)
+        systemListenerBlock = nil
+    }
+
+    deinit {
+        removeSystemListeners()
+        teardownAll()
     }
 }
 
-/// One private aggregate device wrapping a single output device plus a tap per
-/// app routed to it, and one real-time IOProc that mixes every tap into the
-/// output scaled by per-app volume.
+/// A private aggregate device containing one real output subdevice and one
+/// stereo process tap per controlled process routed to that device.
 private final class DeviceGraph {
+    let processIDs: [AudioObjectID]
+
     private let outputDeviceUID: String
-    private let ioQueue = DispatchQueue(label: "com.antigravity.AppVolumeMixer.io", qos: .userInteractive)
+    private let logger: Logger
+    private let ioQueue: DispatchQueue
+    private let onProcessorOverload: (String) -> Void
 
     private var aggregateID: AudioObjectID = .unknown
     private var procID: AudioDeviceIOProcID?
+    private var isStarted = false
     private var tapIDs: [AudioObjectID] = []
-    // Strong refs to the apps in this graph — released only after the IOProc is
-    // destroyed in teardown(), so a volume pointer can never be freed while the
-    // running IOProc still reads it (real-time use-after-free guard).
     private var builtApps: [ControlledApp] = []
-    private var volTable: UnsafeMutableBufferPointer<UnsafeMutablePointer<Float>>?
+    private var volumeTable: UnsafeMutableBufferPointer<UnsafeMutablePointer<Float>>?
+    private var smoothedVolumeTable: UnsafeMutableBufferPointer<Float>?
 
-    init(outputDeviceUID: String, apps: [ControlledApp], logger: Logger) throws {
+    private var overloadListenerBlock: AudioObjectPropertyListenerBlock?
+    private var overloadAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDeviceProcessorOverload,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain
+    )
+
+    init(
+        outputDeviceUID: String,
+        apps: [ControlledApp],
+        logger: Logger,
+        onProcessorOverload: @escaping (String) -> Void
+    ) throws {
         self.outputDeviceUID = outputDeviceUID
-        try build(apps: apps, logger: logger)
+        self.processIDs = apps.map(\.processObjectID)
+        self.logger = logger
+        self.onProcessorOverload = onProcessorOverload
+        self.ioQueue = DispatchQueue(
+            label: "com.antigravity.AppVolumeMixer.io.\(outputDeviceUID)",
+            qos: .userInteractive
+        )
+
+        do {
+            try build(apps: apps)
+        } catch {
+            teardown()
+            throw error
+        }
     }
 
-    deinit { teardown() }
+    private func build(apps: [ControlledApp]) throws {
+        guard let outputDevice = AudioObjectID.readDeviceID(forUID: outputDeviceUID),
+              outputDevice.hasOutputStreams,
+              outputDevice.readTransportType() != kAudioDeviceTransportTypeVirtual else {
+            throw "The selected output device is unavailable."
+        }
+        let deviceName = outputDevice.readDeviceName()
+        let inputBaseOffset = outputDevice.channelCounts(scope: kAudioObjectPropertyScopeInput).channels
+        let preferredStereo = outputDevice.preferredStereoChannels()
 
-    private func build(apps: [ControlledApp], logger: Logger) throws {
-        // 1. One process tap per app.
+        // Use the UID returned by the created tap, as required by Apple's
+        // process-tap sample. Validate every tap before it can reach the IOProc.
         var tapList: [[String: Any]] = []
-        var createdTaps: [AudioObjectID] = []
         for app in apps {
-            let desc = CATapDescription(stereoMixdownOfProcesses: [app.processObjectID])
-            desc.uuid = app.tapUUID
-            desc.muteBehavior = .mutedWhenTapped
-            desc.name = "AVM-\(app.pid)"
-            desc.isPrivate = true
+            let description = CATapDescription(stereoMixdownOfProcesses: [app.processObjectID])
+            description.uuid = app.tapUUID
+            description.muteBehavior = .mutedWhenTapped
+            description.name = "App Volume Mixer – \(app.pid)"
+            description.isPrivate = true
 
             var tapID: AudioObjectID = .unknown
-            let err = AudioHardwareCreateProcessTap(desc, &tapID)
-            guard err == noErr, tapID.isValid else {
-                for t in createdTaps { AudioHardwareDestroyProcessTap(t) }
-                throw "AudioHardwareCreateProcessTap failed for pid \(app.pid): OSStatus \(err)"
+            let createError = AudioHardwareCreateProcessTap(description, &tapID)
+            guard createError == noErr, tapID.isValid else {
+                throw "Could not create a process tap for PID \(app.pid) (OSStatus \(createError))."
             }
-            createdTaps.append(tapID)
+            tapIDs.append(tapID)
+
+            let tapUID = try tapID.readAudioTapUID()
+            let format = try tapID.readAudioTapStreamBasicDescription()
+            guard format.isNativeFloat32PCM, format.mChannelsPerFrame == 2 else {
+                throw "Unsupported tap format for PID \(app.pid): \(format.conciseDescription)."
+            }
+            logger.debug("Tap PID \(app.pid): \(format.conciseDescription, privacy: .public)")
+
             tapList.append([
-                kAudioSubTapUIDKey as String: app.tapUUID.uuidString,
+                kAudioSubTapUIDKey as String: tapUID,
                 kAudioSubTapDriftCompensationKey as String: true,
+                kAudioSubTapDriftCompensationQualityKey as String:
+                    UInt32(kAudioAggregateDriftCompensationMaxQuality),
             ])
         }
-        self.tapIDs = createdTaps
 
-        // 2. Output device this graph plays through. Its own input channel count
-        //    precedes the taps in the aggregate input layout (offsets the tap
-        //    mapping); its preferred stereo pair tells us which output channels
-        //    are L/R (channels 0/1 on a multichannel device may be wrong).
-        let outDevID = AudioObjectID.readDeviceID(forUID: outputDeviceUID)
-        let inputBaseOffset = outDevID?.channelCounts(scope: kAudioObjectPropertyScopeInput).channels ?? 0
-        let stereoOut = outDevID?.preferredStereoChannels() ?? (left: 0, right: 1)
-
-        // 3. Aggregate combining the output sub-device + this group's taps.
-        let aggUID = UUID().uuidString
-        let description: [String: Any] = [
-            kAudioAggregateDeviceNameKey as String: "AppVolumeMixer-\(outputDeviceUID)",
-            kAudioAggregateDeviceUIDKey as String: aggUID,
+        let aggregateUID = AudioMixerEngine.aggregateUIDPrefix + UUID().uuidString
+        let aggregateDescription: [String: Any] = [
+            kAudioAggregateDeviceNameKey as String: "App Volume Mixer – \(deviceName)",
+            kAudioAggregateDeviceUIDKey as String: aggregateUID,
             kAudioAggregateDeviceMainSubDeviceKey as String: outputDeviceUID,
             kAudioAggregateDeviceIsPrivateKey as String: true,
             kAudioAggregateDeviceIsStackedKey as String: false,
@@ -218,171 +310,135 @@ private final class DeviceGraph {
             kAudioAggregateDeviceTapListKey as String: tapList,
         ]
 
-        var aggID: AudioObjectID = .unknown
-        let aggErr = AudioHardwareCreateAggregateDevice(description as CFDictionary, &aggID)
-        guard aggErr == noErr, aggID.isValid else {
-            for t in createdTaps { AudioHardwareDestroyProcessTap(t) }
-            self.tapIDs = []
-            throw "AudioHardwareCreateAggregateDevice failed for \(outputDeviceUID): OSStatus \(aggErr)"
+        var newAggregateID: AudioObjectID = .unknown
+        let aggregateError = AudioHardwareCreateAggregateDevice(
+            aggregateDescription as CFDictionary, &newAggregateID
+        )
+        guard aggregateError == noErr, newAggregateID.isValid else {
+            throw "Could not create the output graph (OSStatus \(aggregateError))."
         }
-        self.aggregateID = aggID
+        aggregateID = newAggregateID
 
-        let inCfg = aggID.channelCounts(scope: kAudioObjectPropertyScopeInput)
-        let outCfg = aggID.channelCounts(scope: kAudioObjectPropertyScopeOutput)
-        let devName = outDevID?.readDeviceName() ?? outputDeviceUID
-        logger.info("""
-        Graph[\(devName, privacy: .public)] taps=\(apps.count) \
-        input channels=\(inCfg.channels) (expected \(inputBaseOffset + apps.count * 2)) \
-        output channels=\(outCfg.channels) baseOffset=\(inputBaseOffset) \
-        stereoOut=(\(stereoOut.left),\(stereoOut.right))
-        """)
+        let inputFormats = try aggregateID.readStreamFormats(scope: kAudioObjectPropertyScopeInput)
+        let outputFormats = try aggregateID.readStreamFormats(scope: kAudioObjectPropertyScopeOutput)
+        guard !inputFormats.isEmpty, !outputFormats.isEmpty else {
+            throw "The aggregate device did not expose usable input and output streams."
+        }
+        guard inputFormats.allSatisfy(\.isNativeFloat32PCM),
+              outputFormats.allSatisfy(\.isNativeFloat32PCM) else {
+            let formats = (inputFormats + outputFormats).map(\.conciseDescription).joined(separator: ", ")
+            throw "Unsupported aggregate stream format: \(formats)."
+        }
 
-        // 4. RT volume-pointer table (tap order) + the mixing IOProc.
-        let table = UnsafeMutableBufferPointer<UnsafeMutablePointer<Float>>.allocate(capacity: apps.count)
-        for (i, app) in apps.enumerated() { table[i] = app.volumePtr }
-        self.volTable = table
-        self.builtApps = apps   // retain so volumePtrs outlive the IOProc
+        let inputChannels = inputFormats.reduce(0) { $0 + Int($1.mChannelsPerFrame) }
+        let outputChannels = outputFormats.reduce(0) { $0 + Int($1.mChannelsPerFrame) }
+        let expectedInputChannels = inputBaseOffset + apps.count * 2
+        guard inputChannels >= expectedInputChannels, outputChannels > 0 else {
+            throw "Unexpected aggregate layout (\(inputChannels) input / \(outputChannels) output channels)."
+        }
 
-        let volBase = table.baseAddress!
+        let stereoOutput = preferredStereo ?? (left: 0, right: min(1, outputChannels - 1))
+        guard stereoOutput.left < outputChannels, stereoOutput.right < outputChannels else {
+            throw "The device's preferred stereo channels are outside its output layout."
+        }
+
+        let volumes = UnsafeMutableBufferPointer<UnsafeMutablePointer<Float>>.allocate(capacity: apps.count)
+        let smoothed = UnsafeMutableBufferPointer<Float>.allocate(capacity: apps.count)
+        for (index, app) in apps.enumerated() {
+            volumes[index] = app.volumePtr
+            smoothed[index] = app.volume
+        }
+        volumeTable = volumes
+        smoothedVolumeTable = smoothed
+        builtApps = apps
+
+        guard let volumeBase = volumes.baseAddress, let smoothedBase = smoothed.baseAddress else {
+            throw "Could not allocate real-time mixer state."
+        }
+
         let tapCount = apps.count
-        let baseOffset = inputBaseOffset
-        let outLeftCh = stereoOut.left
-        let outRightCh = stereoOut.right
-
+        let leftChannel = stereoOutput.left
+        let rightChannel = stereoOutput.right
         var newProcID: AudioDeviceIOProcID?
-        let procErr = AudioDeviceCreateIOProcIDWithBlock(&newProcID, aggID, ioQueue) {
-            _, inInputData, _, outOutputData, _ in
-            DeviceGraph.render(
-                input: inInputData,
-                output: outOutputData,
-                volumes: volBase,
+        let procError = AudioDeviceCreateIOProcIDWithBlock(
+            &newProcID, aggregateID, ioQueue
+        ) { _, inputData, _, outputData, _ in
+            AudioRenderKernel.render(
+                input: inputData,
+                output: outputData,
+                targetVolumes: volumeBase,
+                smoothedVolumes: smoothedBase,
                 tapCount: tapCount,
-                inputBaseOffset: baseOffset,
-                outLeftCh: outLeftCh,
-                outRightCh: outRightCh
+                inputBaseOffset: inputBaseOffset,
+                outLeftChannel: leftChannel,
+                outRightChannel: rightChannel
             )
         }
-        guard procErr == noErr, let liveProc = newProcID else {
-            throw "AudioDeviceCreateIOProcIDWithBlock failed: OSStatus \(procErr)"
+        guard procError == noErr, let liveProcID = newProcID else {
+            throw "Could not install the audio renderer (OSStatus \(procError))."
         }
-        self.procID = liveProc
+        procID = liveProcID
 
-        let startErr = AudioDeviceStart(aggID, liveProc)
-        guard startErr == noErr else {
-            throw "AudioDeviceStart failed: OSStatus \(startErr)"
+        let startError = AudioDeviceStart(aggregateID, liveProcID)
+        guard startError == noErr else {
+            throw "Could not start audio output (OSStatus \(startError))."
         }
+        isStarted = true
+        installOverloadListener(deviceName: deviceName)
+
+        logger.info("""
+        Graph[\(deviceName, privacy: .public)] taps=\(apps.count) \
+        input=\(inputChannels)ch output=\(outputChannels)ch \
+        stereo=(\(stereoOutput.left),\(stereoOutput.right)) driftQuality=max
+        """)
+    }
+
+    private func installOverloadListener(deviceName: String) {
+        let logger = self.logger
+        let report = onProcessorOverload
+        let block: AudioObjectPropertyListenerBlock = { _, _ in
+            logger.error("Processor overload on \(deviceName, privacy: .public)")
+            report(deviceName)
+        }
+        let error = AudioObjectAddPropertyListenerBlock(
+            aggregateID, &overloadAddress, DispatchQueue.main, block
+        )
+        if error == noErr { overloadListenerBlock = block }
     }
 
     func teardown() {
+        if let block = overloadListenerBlock, aggregateID.isValid {
+            AudioObjectRemovePropertyListenerBlock(
+                aggregateID, &overloadAddress, DispatchQueue.main, block
+            )
+        }
+        overloadListenerBlock = nil
+
         if let procID, aggregateID.isValid {
-            AudioDeviceStop(aggregateID, procID)
+            if isStarted { AudioDeviceStop(aggregateID, procID) }
             AudioDeviceDestroyIOProcID(aggregateID, procID)
         }
+        isStarted = false
         procID = nil
+
         if aggregateID.isValid {
             AudioHardwareDestroyAggregateDevice(aggregateID)
             aggregateID = .unknown
         }
-        for t in tapIDs where t.isValid { AudioHardwareDestroyProcessTap(t) }
-        tapIDs = []
-        volTable?.deallocate()
-        volTable = nil
-        // Release apps LAST — strictly after AudioDeviceDestroyIOProcID (which
-        // blocks until no render is in flight), so freeing a volumePtr can never
-        // race a live IOProc read.
-        builtApps = []
+        for tapID in tapIDs where tapID.isValid {
+            AudioHardwareDestroyProcessTap(tapID)
+        }
+        tapIDs.removeAll()
+
+        volumeTable?.deallocate()
+        volumeTable = nil
+        smoothedVolumeTable?.deallocate()
+        smoothedVolumeTable = nil
+
+        // Apps own the target pointers captured by the IOProc, so release them
+        // only after the IOProc has been destroyed.
+        builtApps.removeAll()
     }
 
-    // MARK: - Real-time render
-
-    /// Mixes every stereo tap into the output buffers, scaled by per-app volume.
-    /// Allocation-free and lock-free (stack scratch + vDSP). Assumes Float32.
-    private static func render(
-        input: UnsafePointer<AudioBufferList>,
-        output: UnsafeMutablePointer<AudioBufferList>,
-        volumes: UnsafePointer<UnsafeMutablePointer<Float>>,
-        tapCount: Int,
-        inputBaseOffset: Int,
-        outLeftCh: Int,
-        outRightCh: Int
-    ) {
-        let inList = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: input))
-        let outList = UnsafeMutableAudioBufferListPointer(output)
-
-        withChannelRefs(outList) { outCh, outChCount, outFrames in
-            for c in 0..<outChCount {
-                vDSP_vclr(outCh[c].base, vDSP_Stride(outCh[c].stride), vDSP_Length(outFrames))
-            }
-            guard outChCount > 0, tapCount > 0 else { return }
-
-            withChannelRefs(inList) { inCh, inChCount, inFrames in
-                let frames = min(outFrames, inFrames)
-                guard frames > 0, inChCount > 0 else { return }
-
-                // Route to the device's designated stereo channels (clamped),
-                // not blindly to 0/1 — matters on multichannel output devices.
-                let leftIdx = min(max(outLeftCh, 0), outChCount - 1)
-                let rightIdx = min(max(outRightCh, 0), outChCount - 1)
-
-                for i in 0..<tapCount {
-                    let lInIdx = inputBaseOffset + 2 * i
-                    let rInIdx = inputBaseOffset + 2 * i + 1
-                    guard rInIdx < inChCount else { break }
-                    var v = volumes[i].pointee
-                    if v == 0 { continue }
-
-                    let l = inCh[lInIdx], r = inCh[rInIdx]
-                    let oL = outCh[leftIdx], oR = outCh[rightIdx]
-                    vDSP_vsma(l.base, vDSP_Stride(l.stride), &v,
-                              oL.base, vDSP_Stride(oL.stride),
-                              oL.base, vDSP_Stride(oL.stride), vDSP_Length(frames))
-                    vDSP_vsma(r.base, vDSP_Stride(r.stride), &v,
-                              oR.base, vDSP_Stride(oR.stride),
-                              oR.base, vDSP_Stride(oR.stride), vDSP_Length(frames))
-                }
-
-                var lo: Float = -1, hi: Float = 1
-                for c in 0..<outChCount {
-                    vDSP_vclip(outCh[c].base, vDSP_Stride(outCh[c].stride),
-                               &lo, &hi,
-                               outCh[c].base, vDSP_Stride(outCh[c].stride),
-                               vDSP_Length(frames))
-                }
-            }
-        }
-    }
-
-    private struct ChannelRef { var base: UnsafeMutablePointer<Float>; var stride: Int }
-
-    /// Flattens an AudioBufferList into per-channel (base, stride) refs + frame
-    /// count, using stack scratch (RT-safe).
-    private static func withChannelRefs(
-        _ list: UnsafeMutableAudioBufferListPointer,
-        _ body: (_ chans: UnsafeMutablePointer<ChannelRef>, _ count: Int, _ frames: Int) -> Void
-    ) {
-        var total = 0
-        for b in 0..<list.count { total += Int(list[b].mNumberChannels) }
-        guard total > 0 else {
-            withUnsafeTemporaryAllocation(of: ChannelRef.self, capacity: 1) { p in body(p.baseAddress!, 0, 0) }
-            return
-        }
-        withUnsafeTemporaryAllocation(of: ChannelRef.self, capacity: total) { scratch in
-            var idx = 0
-            var frames = Int.max
-            for b in 0..<list.count {
-                let buf = list[b]
-                let ch = Int(buf.mNumberChannels)
-                guard ch > 0, let data = buf.mData else { continue }
-                let base = data.assumingMemoryBound(to: Float.self)
-                let bufFrames = Int(buf.mDataByteSize) / (MemoryLayout<Float>.size * ch)
-                frames = min(frames, bufFrames)
-                for c in 0..<ch {
-                    scratch[idx] = ChannelRef(base: base + c, stride: ch)
-                    idx += 1
-                }
-            }
-            if frames == Int.max { frames = 0 }
-            body(scratch.baseAddress!, idx, frames)
-        }
-    }
+    deinit { teardown() }
 }

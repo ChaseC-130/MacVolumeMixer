@@ -2,25 +2,22 @@ import SwiftUI
 import AudioToolbox
 import OSLog
 
-/// Owns audio-process discovery, the persistent per-app volume model, and the
-/// single mixing engine. Lives at App scope (see VolumeMixerApp) so taps persist
-/// for the whole app lifetime regardless of whether the menu popover is open.
+/// Owns process discovery, persistent per-app preferences, engine health, and
+/// the UI-facing model. Helper processes that belong to one GUI application are
+/// presented as one mixer row and always change volume/route together.
 @MainActor
 @Observable
 final class MixerManager {
-    /// One row in the UI. A value type observed by SwiftUI; the real-time volume
-    /// truth lives in the matching ControlledApp's volume pointer.
     struct AppMixerEntry: Identifiable {
-        let id: AudioObjectID    // Core Audio process object ID
-        let pid: pid_t
+        let id: String                 // owning application key / bundle ID
         let name: String
         let icon: NSImage
+        let processCount: Int
         var volume: Float
         var isMuted: Bool
-        var targetDeviceUID: String?   // nil = system default output
+        var targetDeviceUID: String?
     }
 
-    /// A selectable output device for per-app routing.
     struct OutputDevice: Identifiable, Hashable {
         let uid: String
         let name: String
@@ -29,59 +26,71 @@ final class MixerManager {
 
     private(set) var activeMixers: [AppMixerEntry] = []
     private(set) var availableOutputDevices: [OutputDevice] = []
+    private(set) var defaultOutputDeviceName = "System Default"
     private(set) var permission: AudioCapturePermission = .unknown
+    private(set) var engineError: String?
+    private(set) var audioWarning: String?
 
-    /// Largest boost the UI/clamp allows (2.0 == 200%).
-    let maxVolume: Float = 2.0
+    let maxVolume = AudioRenderKernel.maximumGain
 
     private let logger = Logger(subsystem: "com.antigravity.AppVolumeMixer", category: "Manager")
     private let engine = AudioMixerEngine()
 
-    // Audio identity → controlled app (holds the RT volume pointer + tap UUID).
     private var controlled: [AudioObjectID: ControlledApp] = [:]
-    // Cached UI metadata so we don't re-resolve names/icons every poll.
-    private struct Meta { let name: String; let icon: NSImage; let key: String; let isApp: Bool }
+    private struct Meta {
+        let name: String
+        let icon: NSImage
+        let key: String
+        let isApp: Bool
+    }
     private var meta: [AudioObjectID: Meta] = [:]
-    // Consecutive polls a controlled app has been audio-inactive (hysteresis).
     private var idlePolls: [AudioObjectID: Int] = [:]
     private let graceLimitPolls = 2
-    // Per-app pre-mute level so unmute restores the previous volume.
-    private var preMute: [AudioObjectID: Float] = [:]
-    // Persisted desired volume keyed by bundleID/exec-name, survives tap churn.
+    private var preMute: [String: Float] = [:]
+
     private var desired: [String: Float] = [:]
     private let desiredDefaultsKey = "AppVolumeMixer.desiredVolumes"
-    // Persisted per-app target output device (UID) keyed the same way.
     private var desiredDevices: [String: String] = [:]
     private let desiredDevicesKey = "AppVolumeMixer.desiredDevices"
 
     private var timer: Timer?
+    private var currentDefaultOutputUID: String?
+    private var hardwareRefreshTask: Task<Void, Never>?
+    private var warningClearTask: Task<Void, Never>?
 
     init() {
         loadDesired()
-        engine.onDefaultDeviceChanged = { [weak self] in
-            // Default output changed: re-route apps that follow it, and refresh
-            // the device list (the default may have appeared/disappeared).
-            self?.refreshDevices()
-            self?.rebuildEngine(force: true)
+
+        engine.onHardwareChanged = { [weak self] in
+            self?.scheduleHardwareRefresh()
         }
+        engine.onProcessorOverload = { [weak self] deviceName in
+            guard let self else { return }
+            self.audioWarning = "Audio was interrupted on \(deviceName). The mixer is still running."
+            self.warningClearTask?.cancel()
+            self.warningClearTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(8))
+                guard !Task.isCancelled else { return }
+                self?.audioWarning = nil
+            }
+        }
+
         permission = PermissionManager.preflight()
         refreshDevices()
     }
 
     // MARK: - Lifecycle
 
-    /// Called once when the app finishes launching. Drives the permission flow
-    /// and starts polling once authorized.
     func start() {
         permission = PermissionManager.preflight()
         switch permission {
         case .authorized:
             beginPolling()
-            refresh()
+            refresh(forceEngine: true)
         case .unknown:
-            requestPermission()   // prompt the user; begin once granted
+            requestPermission()
         case .denied:
-            break                 // UI shows the "Open System Settings" path
+            break
         }
     }
 
@@ -93,107 +102,124 @@ final class MixerManager {
             if granted {
                 self.tearDownAll()
                 self.beginPolling()
-                self.refresh()
+                self.refresh(forceEngine: true)
             }
         }
     }
 
     private func beginPolling() {
         guard timer == nil else { return }
-        let t = Timer(timeInterval: 1.5, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
         }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        timer.tolerance = 0.2
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     // MARK: - Discovery
 
-    /// Polls Core Audio for audio-active processes, reconciles the controlled
-    /// set (with idle hysteresis), rebuilds the engine on membership change, and
-    /// refreshes the UI rows.
-    func refresh() {
+    func refresh(forceEngine: Bool = false) {
         guard permission == .authorized else { return }
-        refreshDevices()
+        let devicesChanged = refreshDevices()
 
-        let active = discoverActiveProcesses()
-        let activeIDs = Set(active.map(\.objectID))
+        guard let processObjectIDs = try? AudioObjectID.readProcessList() else {
+            if devicesChanged || forceEngine { configureEngine(force: true) }
+            return
+        }
+        let presentIDs = Set(processObjectIDs)
+        let active = discoverActiveProcesses(from: processObjectIDs)
         let myPID = ProcessInfo.processInfo.processIdentifier
         var membershipChanged = false
 
-        // Add newly-active processes.
-        for proc in active where controlled[proc.objectID] == nil {
-            guard proc.pid > 0, proc.pid != myPID else { continue }
-            let m = resolveMeta(objectID: proc.objectID, pid: proc.pid)
-            guard m.isApp else { continue }   // skip pure system daemons (e.g. corespeechd)
-            let initial = desired[m.key] ?? 1.0
+        for process in active where controlled[process.objectID] == nil {
+            guard process.pid > 0, process.pid != myPID else { continue }
+            let metadata = resolveMeta(objectID: process.objectID, pid: process.pid)
+            guard metadata.isApp else { continue }
+
             let app = ControlledApp(
-                processObjectID: proc.objectID, pid: proc.pid, key: m.key,
-                initialVolume: initial, targetDeviceUID: desiredDevices[m.key]
+                processObjectID: process.objectID,
+                pid: process.pid,
+                key: metadata.key,
+                initialVolume: desired[metadata.key] ?? 1.0,
+                targetDeviceUID: desiredDevices[metadata.key]
             )
-            controlled[proc.objectID] = app
-            meta[proc.objectID] = m
-            idlePolls[proc.objectID] = 0
+            controlled[process.objectID] = app
+            meta[process.objectID] = metadata
+            idlePolls[process.objectID] = 0
             membershipChanged = true
-            logger.info("Now controlling \(m.name, privacy: .public) (key=\(m.key, privacy: .public), pid=\(proc.pid))")
+            logger.info("Now controlling \(metadata.name, privacy: .public) (pid=\(process.pid))")
         }
 
-        // Age out processes that have gone inactive past the grace period.
-        // Keep retired apps alive across the rebuild: the engine also retains
-        // them until it destroys the old IOProc, but holding a ref here too keeps
-        // the RT volume pointer valid no matter the ordering.
         var retired: [ControlledApp] = []
+        var retiredKeys: Set<String> = []
         for id in Array(controlled.keys) {
-            if activeIDs.contains(id) {
+            // Keep a tap for the lifetime of the Core Audio process object, not
+            // merely while kAudioProcessPropertyIsRunning is true. Audio clients
+            // commonly toggle that flag between tracks or even between short
+            // sounds; tearing down at every pause was a major source of dropouts.
+            if presentIDs.contains(id) {
                 idlePolls[id] = 0
-            } else {
-                let n = (idlePolls[id] ?? 0) + 1
-                idlePolls[id] = n
-                if n >= graceLimitPolls {
-                    if let app = controlled.removeValue(forKey: id) { retired.append(app) }
-                    meta.removeValue(forKey: id)
-                    idlePolls.removeValue(forKey: id)
-                    preMute.removeValue(forKey: id)
-                    membershipChanged = true
-                }
+                continue
             }
+
+            let count = (idlePolls[id] ?? 0) + 1
+            idlePolls[id] = count
+            guard count >= graceLimitPolls else { continue }
+
+            if let app = controlled.removeValue(forKey: id) {
+                retired.append(app)
+                retiredKeys.insert(app.key)
+            }
+            meta.removeValue(forKey: id)
+            idlePolls.removeValue(forKey: id)
+            membershipChanged = true
+        }
+        for key in retiredKeys where !controlled.values.contains(where: { $0.key == key }) {
+            preMute.removeValue(forKey: key)
         }
 
-        if membershipChanged { rebuildEngine() }   // teardown() stops the old IOProc here
+        if membershipChanged || devicesChanged || forceEngine {
+            configureEngine(force: forceEngine || devicesChanged)
+        }
         rebuildUIRows()
-        withExtendedLifetime(retired) {}            // only now may retired volumePtrs free
+        withExtendedLifetime(retired) {}
     }
 
-    private struct ActiveProcess { let objectID: AudioObjectID; let pid: pid_t }
+    private struct ActiveProcess {
+        let objectID: AudioObjectID
+        let pid: pid_t
+    }
 
-    private func discoverActiveProcesses() -> [ActiveProcess] {
-        guard let objectIDs = try? AudioObjectID.readProcessList() else { return [] }
-        var result: [ActiveProcess] = []
-        for objectID in objectIDs {
-            guard objectID.readProcessIsRunning() else { continue }   // audio-active only
-            let pid: pid_t = (try? objectID.read(kAudioProcessPropertyPID, defaultValue: pid_t(-1))) ?? -1
-            guard pid > 0 else { continue }
-            result.append(ActiveProcess(objectID: objectID, pid: pid))
+    private func discoverActiveProcesses(from objectIDs: [AudioObjectID]) -> [ActiveProcess] {
+        return objectIDs.compactMap { objectID in
+            guard objectID.readProcessIsRunningOutput() else { return nil }
+            let pid: pid_t = (try? objectID.read(
+                kAudioProcessPropertyPID, defaultValue: pid_t(-1)
+            )) ?? -1
+            return pid > 0 ? ActiveProcess(objectID: objectID, pid: pid) : nil
         }
-        return result
     }
 
     // MARK: - Engine
 
-    /// Rebuilds the aggregate device for the current controlled set. `force`
-    /// rebuilds even if membership is unchanged (used on default-device change).
-    private func rebuildEngine(force: Bool = false) {
-        let ordered = controlled.values.sorted { $0.pid < $1.pid }   // deterministic tap order
-        // Membership guard only — routing/default changes always pass force:true.
-        if !force && Set(ordered.map(\.processObjectID)) == engine.builtProcessIDs { return }
+    private func configureEngine(force: Bool = false) {
+        let ordered = controlled.values.sorted { $0.pid < $1.pid }
+        let requestedIDs = Set(ordered.map(\.processObjectID))
+        guard force || requestedIDs != engine.configuredProcessIDs else { return }
 
-        do {
-            try engine.rebuild(with: ordered)
-        } catch {
-            logger.error("Engine rebuild failed: \(error.localizedDescription)")
-            // A failure here on macOS is almost always the capture permission.
-            let status = PermissionManager.preflight()
-            if status != .authorized { permission = status }
+        let result = engine.configure(with: ordered)
+        engineError = result.failures.isEmpty ? nil : result.failures.joined(separator: "\n")
+    }
+
+    private func scheduleHardwareRefresh() {
+        hardwareRefreshTask?.cancel()
+        hardwareRefreshTask = Task { [weak self] in
+            // Audio devices often publish several closely spaced notifications.
+            // Let the route settle, then reconcile once.
+            try? await Task.sleep(for: .milliseconds(300))
+            guard !Task.isCancelled else { return }
+            self?.refresh()
         }
     }
 
@@ -204,83 +230,116 @@ final class MixerManager {
         idlePolls.removeAll()
         preMute.removeAll()
         activeMixers = []
+        engineError = nil
     }
 
-    // MARK: - Volume / mute
+    // MARK: - Volume / mute / route
 
-    func setVolume(for id: AudioObjectID, to volume: Float) {
-        let v = max(0, min(volume, maxVolume))
-        guard let app = controlled[id] else { return }
-        let old = app.volume
-        // Track pre-mute level however 0 is reached (slider or mute button), and
-        // clear it once the app is audible again, so unmute restores the last
-        // audible level rather than jumping to 100%.
-        if v == 0 {
-            if old > 0 { preMute[id] = old }
+    func setVolume(for key: String, to volume: Float) {
+        let value = AudioRenderKernel.sanitizedGain(volume)
+        let matching = controlled.values.filter { $0.key == key }
+        guard !matching.isEmpty else { return }
+        let oldValue = matching[0].volume
+
+        if value == 0 {
+            if oldValue > 0 { preMute[key] = oldValue }
         } else {
-            preMute[id] = nil
+            preMute[key] = nil
         }
-        app.setVolume(v)
-        desired[app.key] = v
+        for app in matching { app.setVolume(value) }
+
+        desired[key] = value
         saveDesired()
-        if let i = activeMixers.firstIndex(where: { $0.id == id }) {
-            activeMixers[i].volume = v
-            activeMixers[i].isMuted = (v == 0)
+        if let index = activeMixers.firstIndex(where: { $0.id == key }) {
+            activeMixers[index].volume = value
+            activeMixers[index].isMuted = value == 0
         }
     }
 
-    func toggleMute(for id: AudioObjectID) {
-        guard let app = controlled[id] else { return }
+    func toggleMute(for key: String) {
+        guard let app = controlled.values.first(where: { $0.key == key }) else { return }
         if app.volume > 0 {
-            preMute[id] = app.volume
-            setVolume(for: id, to: 0)
+            preMute[key] = app.volume
+            setVolume(for: key, to: 0)
         } else {
-            let restore = preMute[id] ?? 1.0
-            setVolume(for: id, to: restore > 0 ? restore : 1.0)
+            let restore = preMute[key] ?? 1.0
+            setVolume(for: key, to: restore > 0 ? restore : 1.0)
         }
     }
 
-    /// Routes an app to a specific output device (nil = system default).
-    func setOutputDevice(for id: AudioObjectID, uid: String?) {
-        guard let app = controlled[id] else { return }
-        app.targetDeviceUID = uid
-        if let uid { desiredDevices[app.key] = uid } else { desiredDevices.removeValue(forKey: app.key) }
+    func setOutputDevice(for key: String, uid: String?) {
+        let matching = controlled.values.filter { $0.key == key }
+        guard !matching.isEmpty else { return }
+        for app in matching { app.targetDeviceUID = uid }
+
+        if let uid {
+            desiredDevices[key] = uid
+        } else {
+            desiredDevices.removeValue(forKey: key)
+        }
         saveDesiredDevices()
-        if let i = activeMixers.firstIndex(where: { $0.id == id }) {
-            activeMixers[i].targetDeviceUID = uid
+        if let index = activeMixers.firstIndex(where: { $0.id == key }) {
+            activeMixers[index].targetDeviceUID = uid
         }
-        rebuildEngine(force: true)   // re-group apps by device
+        configureEngine(force: true)
     }
 
-    // MARK: - Output device enumeration
+    // MARK: - Output devices
 
-    private func refreshDevices() {
-        guard let ids = try? AudioObjectID.readAllDeviceIDs() else { return }
+    @discardableResult
+    private func refreshDevices() -> Bool {
+        let oldUIDs = Set(availableOutputDevices.map(\.uid))
+        let oldDefaultUID = currentDefaultOutputUID
+        guard let ids = try? AudioObjectID.readAllDeviceIDs() else { return false }
+
         var list: [OutputDevice] = []
+        var seen: Set<String> = []
         for id in ids where id.hasOutputStreams {
-            guard let uid = try? id.readDeviceUID() else { continue }
-            list.append(OutputDevice(uid: uid, name: id.readDeviceName()))
+            guard let uid = try? id.readDeviceUID(), seen.insert(uid).inserted else { continue }
+
+            // Private graphs are visible to their creating process. Never offer
+            // them as destinations or a user can accidentally route a graph
+            // back into itself.
+            let name = id.readDeviceName()
+            let transport = id.readTransportType()
+            let isOurAggregate = uid.hasPrefix(AudioMixerEngine.aggregateUIDPrefix)
+                || (transport == kAudioDeviceTransportTypeAggregate
+                    && name.hasPrefix("App Volume Mixer –"))
+            // Loopback and virtual-mixer devices can create a recursive graph or
+            // deadlock the HAL when used as this mixer's output destination.
+            guard !isOurAggregate, transport != kAudioDeviceTransportTypeVirtual else { continue }
+            list.append(OutputDevice(uid: uid, name: name))
         }
         list.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
         if list != availableOutputDevices { availableOutputDevices = list }
+
+        if let defaultID = try? AudioObjectID.readDefaultOutputDevice(), defaultID.isValid {
+            defaultOutputDeviceName = defaultID.readDeviceName()
+            currentDefaultOutputUID = try? defaultID.readDeviceUID()
+        } else {
+            defaultOutputDeviceName = "Unavailable"
+            currentDefaultOutputUID = nil
+        }
+        return oldUIDs != Set(list.map(\.uid)) || oldDefaultUID != currentDefaultOutputUID
     }
 
     // MARK: - UI rows
 
     private func rebuildUIRows() {
-        let rows: [AppMixerEntry] = controlled.values.compactMap { app in
-            guard let m = meta[app.processObjectID] else { return nil }
+        let grouped = Dictionary(grouping: controlled.values, by: \.key)
+        let rows: [AppMixerEntry] = grouped.compactMap { key, apps in
+            guard let app = apps.min(by: { $0.pid < $1.pid }),
+                  let metadata = meta[app.processObjectID] else { return nil }
             return AppMixerEntry(
-                id: app.processObjectID,
-                pid: app.pid,
-                name: m.name,
-                icon: m.icon,
+                id: key,
+                name: metadata.name,
+                icon: metadata.icon,
+                processCount: apps.count,
                 volume: app.volume,
                 isMuted: app.volume == 0,
                 targetDeviceUID: app.targetDeviceUID
             )
         }
-        // Alphabetical, computed only on rebuild (stable identity keeps rows put).
         activeMixers = rows.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
@@ -289,32 +348,24 @@ final class MixerManager {
     // MARK: - Metadata
 
     private func resolveMeta(objectID: AudioObjectID, pid: pid_t) -> Meta {
-        // Audio often comes from a helper child process (e.g. "Google Chrome
-        // Helper"), not the main app. Walk up to the owning GUI app so we show
-        // the right name + icon, and so daemons (no owning app) are filtered.
         let owningApp = responsibleApp(for: pid)
-        let bundleID = owningApp?.bundleIdentifier ?? objectID.readProcessBundleID()
+        let processBundleID = objectID.readProcessBundleID()
         let name = owningApp?.localizedName ?? processName(pid: pid) ?? "Process \(pid)"
-        // Key on the owning app's bundle id so e.g. all Chrome tabs share one
-        // persisted volume and survive helper churn.
-        let key = owningApp?.bundleIdentifier ?? bundleID ?? processName(pid: pid) ?? "pid:\(pid)"
+        let key = owningApp?.bundleIdentifier
+            ?? processBundleID
+            ?? processName(pid: pid)
+            ?? "pid:\(pid)"
         let icon = owningApp?.icon ?? NSWorkspace.shared.icon(for: .unixExecutable)
-        // Only control processes owned by a real registered app. System daemons
-        // (corespeechd, mediaremoted, …) descend from launchd with no owning app
-        // — even though Core Audio may report a bundle id for them — so they are
-        // filtered out (and never tapped, avoiding interference with Siri/etc.).
-        let isApp = owningApp != nil
-        return Meta(name: name, icon: icon, key: key, isApp: isApp)
+        return Meta(name: name, icon: icon, key: key, isApp: owningApp != nil)
     }
 
-    /// Finds the GUI application that "owns" a pid by walking up the parent
-    /// process chain — maps a browser/Electron audio helper to its main app.
-    /// Returns nil for system daemons whose ancestors are not registered apps.
     private func responsibleApp(for pid: pid_t) -> NSRunningApplication? {
-        let apps = NSWorkspace.shared.runningApplications
+        let applications = NSWorkspace.shared.runningApplications
         var current = pid
         for _ in 0..<12 {
-            if let app = apps.first(where: { $0.processIdentifier == current }) { return app }
+            if let app = applications.first(where: { $0.processIdentifier == current }) {
+                return app
+            }
             let parent = parentPID(of: current)
             guard parent > 1, parent != current else { break }
             current = parent
@@ -325,25 +376,25 @@ final class MixerManager {
     private func parentPID(of pid: pid_t) -> pid_t {
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
-        let n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
-        return n == size ? pid_t(info.pbi_ppid) : 0
+        let count = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size)
+        return count == size ? pid_t(info.pbi_ppid) : 0
     }
 
     private func processName(pid: pid_t) -> String? {
         let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(MAXPATHLEN))
         defer { buffer.deallocate() }
-        let len = proc_name(pid, buffer, UInt32(MAXPATHLEN))
-        return len > 0 ? String(cString: buffer) : nil
+        let length = proc_name(pid, buffer, UInt32(MAXPATHLEN))
+        return length > 0 ? String(cString: buffer) : nil
     }
 
     // MARK: - Persistence
 
     private func loadDesired() {
-        if let dict = UserDefaults.standard.dictionary(forKey: desiredDefaultsKey) as? [String: Double] {
-            desired = dict.mapValues { Float($0) }
+        if let values = UserDefaults.standard.dictionary(forKey: desiredDefaultsKey) as? [String: Double] {
+            desired = values.mapValues { AudioRenderKernel.sanitizedGain(Float($0)) }
         }
-        if let dict = UserDefaults.standard.dictionary(forKey: desiredDevicesKey) as? [String: String] {
-            desiredDevices = dict
+        if let devices = UserDefaults.standard.dictionary(forKey: desiredDevicesKey) as? [String: String] {
+            desiredDevices = devices
         }
     }
 
