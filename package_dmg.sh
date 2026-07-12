@@ -36,6 +36,22 @@ create-dmg \
 rm -rf "$STAGING"
 [[ -f "$DMG" ]] || { echo "DMG was not created"; exit 1; }
 
+# Sign the container itself when a Developer ID identity is available. The app
+# inside is already signed by build.sh, but Gatekeeper's primary-signature check
+# also expects a signed DMG for a warning-free downloaded release.
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+  SIGN="$SIGN_IDENTITY"
+else
+  SIGN="$(security find-identity -p codesigning -v 2>/dev/null | awk '/Developer ID Application/{print $2; exit}')"
+fi
+if [[ -n "$SIGN" ]]; then
+  echo "==> Signing DMG: $SIGN"
+  codesign --force --timestamp --sign "$SIGN" "$DMG"
+  codesign --verify --verbose=2 "$DMG"
+else
+  echo "==> No Developer ID identity found; DMG container will be unsigned"
+fi
+
 if [[ -n "${NOTARY_PROFILE:-}" ]]; then
   echo "==> Notarizing (profile: $NOTARY_PROFILE)"
   xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
